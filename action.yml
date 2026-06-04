@@ -35,9 +35,10 @@ inputs:
   mode:
     description: |
       Action mode:
-        "setup"  — generate config + index codebase (default, runs on push to main)
-        "learn"  — auto-learn lessons from recent git commits (ideal on PR merge)
-        "scan"   — scan an open PR for predicted failure modes and post a comment
+        "setup"    — generate config + index codebase (default, runs on push to main)
+        "learn"    — auto-learn lessons from recent git commits (ideal on PR merge)
+        "scan"     — scan an open PR for predicted failure modes and post a comment
+        "hygiene"  — sweep Brain for stale/orphan lessons and flag/archive them (weekly schedule)
     required: false
     default: 'setup'
   learn-max-commits:
@@ -337,3 +338,34 @@ runs:
         else
           echo "ℹ️  Comment posting skipped (POST_COMMENT=$POST_COMMENT, PR_NUMBER=$PR_NUMBER)"
         fi
+
+    # ── mode: hygiene ──────────────────────────────────────────────────────────
+    - name: Brain hygiene sweep (autonomous maintenance)
+      id: hygiene
+      if: ${{ inputs.mode == 'hygiene' }}
+      shell: bash
+      env:
+        CACHLY_API_KEY: ${{ inputs.api-key }}
+        CACHLY_API_URL: ${{ inputs.api-url }}
+        CACHLY_INSTANCE_ID: ${{ inputs.instance-id }}
+      run: |
+        set -euo pipefail
+
+        echo "🧹 Cachly Brain — running hygiene sweep..."
+        echo "   Instance: $CACHLY_INSTANCE_ID"
+
+        # Run the brain_hygiene MCP tool via the server CLI
+        RESULT=$(npx --yes @cachly-dev/mcp-server@latest hygiene \
+          --instance-id "$CACHLY_INSTANCE_ID" 2>&1) || {
+          echo "⚠️  Brain hygiene CLI unavailable — falling back to API call."
+          # Fallback: call the brain_hygiene tool via the /api/v1/mcp endpoint if available
+          RESULT=$(curl -sf \
+            -X POST \
+            -H "Authorization: Bearer $CACHLY_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "{\"tool\":\"brain_hygiene\",\"args\":{\"instance_id\":\"$CACHLY_INSTANCE_ID\"}}" \
+            "${CACHLY_API_URL}/api/v1/mcp/call" 2>&1) || RESULT="Hygiene skipped (offline)"
+        }
+
+        echo "$RESULT"
+        echo "✅ Brain hygiene sweep complete."
