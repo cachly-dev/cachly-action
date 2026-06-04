@@ -1,5 +1,5 @@
 name: 'Cachly Brain Setup'
-description: 'Configure AI Brain memory for your repo — generates copilot-instructions.md, .mcp.json, and indexes the project codebase'
+description: 'Configure AI Brain memory for your repo — generates copilot-instructions.md, .mcp.json, indexes the codebase, and scans PRs for predicted failures'
 author: 'cachly'
 branding:
   icon: 'cpu'
@@ -33,13 +33,37 @@ inputs:
     required: false
     default: '500'
   mode:
-    description: 'Action mode: "setup" (default — generate config + index) or "learn" (auto-learn lessons from recent git commits, ideal on PR merge)'
+    description: |
+      Action mode:
+        "setup"  — generate config + index codebase (default, runs on push to main)
+        "learn"  — auto-learn lessons from recent git commits (ideal on PR merge)
+        "scan"   — scan an open PR for predicted failure modes and post a comment
     required: false
     default: 'setup'
   learn-max-commits:
     description: 'In learn mode: how many recent commits to learn from'
     required: false
     default: '50'
+  pr-number:
+    description: 'In scan mode: PR number to comment on (e.g. ${{ github.event.pull_request.number }})'
+    required: false
+    default: ''
+  pr-title:
+    description: 'In scan mode: PR title for context matching (e.g. ${{ github.event.pull_request.title }})'
+    required: false
+    default: ''
+  pr-body:
+    description: 'In scan mode: PR description for context matching'
+    required: false
+    default: ''
+  scan-top-k:
+    description: 'In scan mode: maximum number of failure modes to surface (1–20)'
+    required: false
+    default: '7'
+  scan-post-comment:
+    description: 'In scan mode: post the result as a PR comment (true/false). Requires the GITHUB_TOKEN env var.'
+    required: false
+    default: 'true'
 
 outputs:
   instructions-path:
@@ -48,10 +72,17 @@ outputs:
   indexed-files:
     description: 'Number of files indexed into the Brain (if index-project=true)'
     value: ${{ steps.index.outputs.indexed-files }}
+  risk-score:
+    description: 'In scan mode: 0–100 risk score for the PR (0 = no known issues)'
+    value: ${{ steps.scan.outputs.risk-score }}
+  failures-json:
+    description: 'In scan mode: JSON array of predicted failure modes'
+    value: ${{ steps.scan.outputs.failures-json }}
 
 runs:
   using: 'composite'
   steps:
+    # ── mode: setup ────────────────────────────────────────────────────────────
     - name: Setup Cachly Brain
       id: setup
       if: ${{ inputs.mode == 'setup' }}
@@ -156,18 +187,17 @@ runs:
         echo "   Instance: $CACHLY_BRAIN_INSTANCE_ID"
         echo "   Max files: ${{ inputs.index-max-files }}"
 
-        # Run indexing via the MCP server CLI — outputs number of files indexed
         RESULT=$(npx --yes @cachly-dev/mcp-server@latest index . \
           --instance-id "$CACHLY_BRAIN_INSTANCE_ID" \
           --max-files "${{ inputs.index-max-files }}" 2>&1) || true
 
         echo "$RESULT"
 
-        # Extract indexed file count from output (format: "Indexed X files")
         INDEXED=$(echo "$RESULT" | grep -oE '[0-9]+ (file|files) indexed' | grep -oE '^[0-9]+' || echo "0")
         echo "indexed-files=$INDEXED" >> "$GITHUB_OUTPUT"
         echo "✅ Brain indexing complete: $INDEXED files"
 
+    # ── mode: learn ────────────────────────────────────────────────────────────
     - name: Learn from git commits (PR merge)
       id: learn
       if: ${{ inputs.mode == 'learn' }}
@@ -191,3 +221,119 @@ runs:
           --max-commits "${{ inputs.learn-max-commits }}" || true
 
         echo "✅ Brain learned from merged commits."
+
+    # ── mode: scan ─────────────────────────────────────────────────────────────
+    - name: Brain risk scan (PR failure prediction)
+      id: scan
+      if: ${{ inputs.mode == 'scan' }}
+      shell: bash
+      env:
+        CACHLY_API_KEY: ${{ inputs.api-key }}
+        CACHLY_API_URL: ${{ inputs.api-url }}
+        CACHLY_INSTANCE_ID: ${{ inputs.instance-id }}
+        PR_NUMBER: ${{ inputs.pr-number }}
+        PR_TITLE: ${{ inputs.pr-title }}
+        PR_BODY: ${{ inputs.pr-body }}
+        SCAN_TOP_K: ${{ inputs.scan-top-k }}
+        POST_COMMENT: ${{ inputs.scan-post-comment }}
+        GH_TOKEN: ${{ env.GITHUB_TOKEN }}
+      run: |
+        set -euo pipefail
+
+        echo "🧠 Cachly Brain — scanning PR for predicted failures..."
+        echo "   Instance: $CACHLY_INSTANCE_ID"
+        echo "   PR: #${PR_NUMBER} — ${PR_TITLE}"
+
+        # ── Call the scan API ─────────────────────────────────────────────────
+        PAYLOAD=$(printf '{"pr_title":"%s","pr_body":"%s","top_k":%s}' \
+          "$(echo "$PR_TITLE" | sed 's/"/\\"/g')" \
+          "$(echo "$PR_BODY"  | head -c 1800 | sed 's/"/\\"/g; s/\n/ /g')" \
+          "$SCAN_TOP_K")
+
+        RESPONSE=$(curl -sf \
+          -X POST \
+          -H "Authorization: Bearer $CACHLY_API_KEY" \
+          -H "Content-Type: application/json" \
+          -d "$PAYLOAD" \
+          "${CACHLY_API_URL}/api/v1/instances/${CACHLY_INSTANCE_ID}/scan" 2>&1) || {
+          echo "⚠️  Brain scan API unreachable — skipping (non-blocking)."
+          echo "risk-score=0"  >> "$GITHUB_OUTPUT"
+          echo "failures-json=[]" >> "$GITHUB_OUTPUT"
+          exit 0
+        }
+
+        RISK_SCORE=$(echo "$RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('risk_score',0))" 2>/dev/null || echo "0")
+        FAILURES_JSON=$(echo "$RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(json.dumps(d.get('failures',[])))" 2>/dev/null || echo "[]")
+        MATCHED=$(echo "$RESPONSE"      | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('matched_lessons',0))" 2>/dev/null || echo "0")
+        SAFE_NOTE=$(echo "$RESPONSE"    | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('safe_note',''))" 2>/dev/null || echo "")
+
+        echo "risk-score=$RISK_SCORE"     >> "$GITHUB_OUTPUT"
+        echo "failures-json=$FAILURES_JSON" >> "$GITHUB_OUTPUT"
+
+        echo ""
+        echo "🔍 Brain scan complete: risk_score=$RISK_SCORE, matched_lessons=$MATCHED"
+
+        # ── Format risk indicator ─────────────────────────────────────────────
+        if   [ "$RISK_SCORE" -ge 70 ]; then RISK_ICON="🔴"; RISK_LABEL="High"
+        elif [ "$RISK_SCORE" -ge 35 ]; then RISK_ICON="🟡"; RISK_LABEL="Medium"
+        else                                 RISK_ICON="🟢"; RISK_LABEL="Low"
+        fi
+
+        # ── Build markdown comment ────────────────────────────────────────────
+        COMMENT_BODY="## 🧠 Cachly Brain — PR Risk Scan
+
+        **Risk score:** ${RISK_ICON} **${RISK_LABEL}** (${RISK_SCORE}/100) · ${MATCHED} matching lessons in Brain
+
+        "
+
+        if [ -n "$SAFE_NOTE" ]; then
+          COMMENT_BODY="${COMMENT_BODY}> ${SAFE_NOTE}
+
+        "
+        fi
+
+        # Parse failures and append rows
+        FAILURE_ROWS=$(echo "$FAILURES_JSON" | python3 -c "
+        import sys, json
+        failures = json.load(sys.stdin)
+        if not failures:
+            print('_No matching failure patterns found in Brain._')
+            sys.exit(0)
+        rows = []
+        sev_icon = {'critical': '🔴', 'major': '🟠', 'minor': '🟡', 'info': '🔵'}
+        for f in failures:
+            icon   = sev_icon.get(f.get('severity','info'), '⚪')
+            topic  = f.get('topic','?')
+            conf   = int(f.get('confidence', 0) * 100)
+            msg    = (f.get('message','') or '')[:120]
+            fix    = (f.get('fix','') or '')[:120]
+            cmds   = f.get('commands') or []
+            cmd_str = ' \`' + '\`, \`'.join(cmds[:2]) + '\`' if cmds else ''
+            rows.append(f'| {icon} \`{topic}\` | {conf}% | {msg} | {fix}{cmd_str} |')
+        print('| Severity | Topic | Confidence | Known issue | Suggested fix |')
+        print('|---|---|---|---|---|')
+        for r in rows:
+            print(r)
+        " 2>/dev/null || echo "_Could not parse failure data._")
+
+        COMMENT_BODY="${COMMENT_BODY}${FAILURE_ROWS}
+
+        ---
+        <sub>🧠 Powered by [Cachly Brain](https://cachly.dev) · lessons from your team's git history · [cachly-dev/cachly-action](https://github.com/cachly-dev/cachly-action)</sub>"
+
+        # Remove leading whitespace from heredoc indentation
+        COMMENT_BODY=$(echo "$COMMENT_BODY" | sed 's/^        //')
+
+        echo ""
+        echo "--- Brain scan comment preview ---"
+        echo "$COMMENT_BODY"
+        echo "----------------------------------"
+
+        # ── Post PR comment ───────────────────────────────────────────────────
+        if [ "$POST_COMMENT" = "true" ] && [ -n "$PR_NUMBER" ] && [ -n "${GH_TOKEN:-}" ]; then
+          echo "$COMMENT_BODY" | gh pr comment "$PR_NUMBER" \
+            --repo "$GITHUB_REPOSITORY" \
+            --body-file - && echo "✅ Brain scan comment posted on PR #$PR_NUMBER"
+        else
+          echo "ℹ️  Comment posting skipped (POST_COMMENT=$POST_COMMENT, PR_NUMBER=$PR_NUMBER)"
+        fi
