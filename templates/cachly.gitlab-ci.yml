@@ -1,0 +1,161 @@
+# Cachly Brain — GitLab CI/CD template
+#
+# The GitLab equivalent of the `cachly-dev/cachly-action` GitHub Action.
+# Same modes (setup, learn, scan, confirm, hygiene), same Brain API, same
+# self-calibrating closed loop — reported to the Brain as source "gitlab_ci".
+#
+# Usage — add this to your project's .gitlab-ci.yml:
+#
+#   include:
+#     - remote: 'https://raw.githubusercontent.com/cachly-dev/cachly-action/main/templates/cachly.gitlab-ci.yml'
+#
+# Then set these CI/CD variables (Settings → CI/CD → Variables):
+#   CACHLY_API_KEY      (masked, protected)  — your cky_live_... key
+#   CACHLY_INSTANCE_ID                       — your Brain instance UUID
+#   CACHLY_API_URL      (optional)           — defaults to https://api.cachly.dev
+#
+# Each job below is hidden (".cachly_*") so it never runs unless you opt in by
+# extending it. See the examples at the bottom.
+
+variables:
+  CACHLY_API_URL: "https://api.cachly.dev"
+  CACHLY_LEARN_MAX_COMMITS: "20"
+  CACHLY_SCAN_TOP_K: "5"
+
+# ── mode: learn ──────────────────────────────────────────────────────────────
+# Auto-learn from recent commits. Run on merges to your default branch.
+.cachly_learn:
+  image: node:20-slim
+  variables:
+    GIT_DEPTH: "0" # full history so learn-git can read commits
+  script:
+    - echo "🧠 Cachly Brain — auto-learning from recent git commits..."
+    - >
+      npx --yes @cachly-dev/mcp-server@latest learn-git .
+      --instance-id "$CACHLY_INSTANCE_ID"
+      --max-commits "$CACHLY_LEARN_MAX_COMMITS" || true
+    - echo "✅ Brain learned from merged commits."
+
+# ── mode: scan ───────────────────────────────────────────────────────────────
+# Predict failures for a merge request before it merges. Non-blocking.
+.cachly_scan:
+  image: python:3.12-slim
+  before_script:
+    - pip install --quiet requests >/dev/null 2>&1 || true
+  script:
+    - |
+      python3 - <<'PY'
+      import os, json, urllib.request, urllib.error
+
+      api = os.environ.get("CACHLY_API_URL", "https://api.cachly.dev").rstrip("/")
+      inst = os.environ["CACHLY_INSTANCE_ID"]
+      key = os.environ["CACHLY_API_KEY"]
+      title = os.environ.get("CI_MERGE_REQUEST_TITLE", os.environ.get("CI_COMMIT_TITLE", ""))
+      body = os.environ.get("CI_MERGE_REQUEST_DESCRIPTION", "")[:1800]
+      top_k = int(os.environ.get("CACHLY_SCAN_TOP_K", "5"))
+
+      payload = json.dumps({"pr_title": title, "pr_body": body, "top_k": top_k}).encode()
+      req = urllib.request.Request(
+          f"{api}/api/v1/instances/{inst}/scan",
+          data=payload,
+          headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+          method="POST",
+      )
+      try:
+          with urllib.request.urlopen(req, timeout=15) as r:
+              d = json.load(r)
+      except (urllib.error.URLError, urllib.error.HTTPError) as e:
+          print(f"⚠️  Brain scan API unreachable — skipping (non-blocking): {e}")
+          raise SystemExit(0)
+
+      risk = d.get("risk_score", 0)
+      failures = d.get("failures", [])
+      matched = d.get("matched_lessons", 0)
+      icon = "🔴" if risk >= 70 else "🟡" if risk >= 35 else "🟢"
+      print(f"{icon} Brain scan complete: risk_score={risk}, matched_lessons={matched}")
+      for f in failures:
+          print(f"  • {f.get('topic','?')} ({int(f.get('confidence',0)*100)}%) — {f.get('message','')}")
+
+      # Persist topics so a downstream confirm job can self-calibrate.
+      with open("cachly_scan.env", "w") as fh:
+          fh.write("CACHLY_SCAN_TOPICS=" + ",".join(f.get("topic", "") for f in failures) + "\n")
+      PY
+  artifacts:
+    reports:
+      dotenv: cachly_scan.env
+    expire_in: 1 day
+
+# ── mode: confirm ────────────────────────────────────────────────────────────
+# Closed-loop self-calibration: report the pipeline outcome so the Brain
+# boosts confirmed failures (+15%) and decays false positives (−10%).
+# Set CACHLY_CI_TOPICS to the topics this pipeline touched; CACHLY_SCAN_TOPICS
+# is inherited automatically from a prior .cachly_scan job via dotenv.
+.cachly_confirm:
+  image: python:3.12-slim
+  variables:
+    CACHLY_CI_JOB_STATUS: "$CI_JOB_STATUS" # GitLab sets this for after_script / when:always
+  script:
+    - |
+      python3 - <<'PY'
+      import os, json, urllib.request, urllib.error
+
+      api = os.environ.get("CACHLY_API_URL", "https://api.cachly.dev").rstrip("/")
+      inst = os.environ["CACHLY_INSTANCE_ID"]
+      key = os.environ["CACHLY_API_KEY"]
+      status = os.environ.get("CACHLY_CI_JOB_STATUS", "").strip().lower()
+      # GitLab statuses → Brain statuses
+      status = {"success": "success", "failed": "failure", "canceled": "cancelled"}.get(status, status)
+
+      topics = [t.strip() for t in os.environ.get("CACHLY_CI_TOPICS", "").split(",") if t.strip()]
+      scan_topics = [t.strip() for t in os.environ.get("CACHLY_SCAN_TOPICS", "").split(",") if t.strip()]
+
+      if not topics:
+          print("⚠️  CACHLY_CI_TOPICS is empty — nothing to confirm.")
+          raise SystemExit(0)
+      if status == "cancelled":
+          print("ℹ️  Pipeline cancelled — not reporting to Brain.")
+          raise SystemExit(0)
+
+      payload = json.dumps({
+          "job_status": status,
+          "topics": topics,
+          "scan_topics": scan_topics,
+          "source": "gitlab_ci",
+      }).encode()
+      req = urllib.request.Request(
+          f"{api}/api/v1/instances/{inst}/ci-outcome",
+          data=payload,
+          headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+          method="POST",
+      )
+      try:
+          with urllib.request.urlopen(req, timeout=15) as r:
+              d = json.load(r)
+      except (urllib.error.URLError, urllib.error.HTTPError) as e:
+          print(f"⚠️  Brain CI outcome API unreachable — skipping (non-blocking): {e}")
+          raise SystemExit(0)
+
+      updated = d.get("updated", 0)
+      if updated > 0:
+          print(f"✅ Brain self-calibrated: {updated} lesson confidence(s) updated from CI signal.")
+      else:
+          print("✅ Brain confirmed — no confidence changes needed.")
+      PY
+
+# ── Examples (copy into your .gitlab-ci.yml, do not uncomment here) ───────────
+#
+# learn-from-commits:
+#   extends: .cachly_learn
+#   rules:
+#     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+#
+# scan-mr:
+#   extends: .cachly_scan
+#   rules:
+#     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+#
+# confirm-outcome:
+#   extends: .cachly_confirm
+#   when: always          # run even if earlier jobs failed, so failures are reported
+#   variables:
+#     CACHLY_CI_TOPICS: "auth:jwt,deploy:k8s"
