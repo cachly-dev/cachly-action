@@ -39,6 +39,7 @@ inputs:
         "learn"    — auto-learn lessons from recent git commits (ideal on PR merge)
         "scan"     — scan an open PR for predicted failure modes and post a comment
         "hygiene"  — sweep Brain for stale/orphan lessons and flag/archive them (weekly schedule)
+        "confirm"  — report CI outcome back to the Brain to self-calibrate confidence (run at end of pipeline)
     required: false
     default: 'setup'
   learn-max-commits:
@@ -65,6 +66,18 @@ inputs:
     description: 'In scan mode: post the result as a PR comment (true/false). Requires the GITHUB_TOKEN env var.'
     required: false
     default: 'true'
+  ci-job-status:
+    description: 'In confirm mode: outcome of the CI job — "success", "failure", or "cancelled"'
+    required: false
+    default: ''
+  ci-topics:
+    description: 'In confirm mode: comma-separated list of Brain topics touched by this CI run (e.g. "auth:jwt,deploy:k8s")'
+    required: false
+    default: ''
+  ci-scan-topics:
+    description: 'In confirm mode: comma-separated topics the brain predicted would fail (from a previous scan step). Used to detect false positives.'
+    required: false
+    default: ''
 
 outputs:
   instructions-path:
@@ -79,6 +92,9 @@ outputs:
   failures-json:
     description: 'In scan mode: JSON array of predicted failure modes'
     value: ${{ steps.scan.outputs.failures-json }}
+  ci-updated:
+    description: 'In confirm mode: number of lesson confidences updated'
+    value: ${{ steps.confirm.outputs.ci-updated }}
 
 runs:
   using: 'composite'
@@ -369,3 +385,76 @@ runs:
 
         echo "$RESULT"
         echo "✅ Brain hygiene sweep complete."
+
+    # ── mode: confirm ───────────────────────────────────────────────────────────
+    - name: Confirm CI outcome to Brain (closed-loop calibration)
+      id: confirm
+      if: ${{ inputs.mode == 'confirm' }}
+      shell: bash
+      env:
+        CACHLY_API_KEY: ${{ inputs.api-key }}
+        CACHLY_API_URL: ${{ inputs.api-url }}
+        CACHLY_INSTANCE_ID: ${{ inputs.instance-id }}
+        JOB_STATUS: ${{ inputs.ci-job-status }}
+        CI_TOPICS: ${{ inputs.ci-topics }}
+        CI_SCAN_TOPICS: ${{ inputs.ci-scan-topics }}
+      run: |
+        set -euo pipefail
+
+        echo "🤖 Cachly Brain — reporting CI outcome for self-calibration..."
+        echo "   Instance: $CACHLY_INSTANCE_ID"
+        echo "   Status:   $JOB_STATUS"
+
+        if [ -z "$CI_TOPICS" ]; then
+          echo "⚠️  ci-topics is empty — nothing to confirm."
+          echo "ci-updated=0" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # Convert comma-separated topics to JSON array.
+        TOPICS_JSON=$(echo "$CI_TOPICS" | python3 -c "
+import sys, json
+raw = sys.stdin.read().strip()
+topics = [t.strip() for t in raw.split(',') if t.strip()]
+print(json.dumps(topics))
+")
+
+        SCAN_JSON="[]"
+        if [ -n "$CI_SCAN_TOPICS" ]; then
+          SCAN_JSON=$(echo "$CI_SCAN_TOPICS" | python3 -c "
+import sys, json
+raw = sys.stdin.read().strip()
+topics = [t.strip() for t in raw.split(',') if t.strip()]
+print(json.dumps(topics))
+")
+        fi
+
+        PAYLOAD=$(python3 -c "
+import json, sys
+print(json.dumps({
+  'job_status': '$JOB_STATUS',
+  'topics': $TOPICS_JSON,
+  'scan_topics': $SCAN_JSON,
+  'source': 'github_actions',
+}))
+")
+
+        RESPONSE=$(curl -sf \
+          -X POST \
+          -H "Authorization: Bearer $CACHLY_API_KEY" \
+          -H "Content-Type: application/json" \
+          -d "$PAYLOAD" \
+          "${CACHLY_API_URL}/api/v1/instances/${CACHLY_INSTANCE_ID}/ci-outcome" 2>&1) || {
+          echo "⚠️  Brain CI outcome API unreachable — skipping (non-blocking)."
+          echo "ci-updated=0" >> "$GITHUB_OUTPUT"
+          exit 0
+        }
+
+        UPDATED=$(echo "$RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('updated',0))" 2>/dev/null || echo "0")
+        echo "ci-updated=$UPDATED" >> "$GITHUB_OUTPUT"
+
+        if [ "$UPDATED" -gt 0 ]; then
+          echo "✅ Brain self-calibrated: $UPDATED lesson confidence(s) updated from CI signal."
+        else
+          echo "✅ Brain confirmed — no confidence changes needed."
+        fi
