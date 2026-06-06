@@ -28,6 +28,53 @@ jobs:
           file_pattern: '.github/copilot-instructions.md .mcp.json'
 ```
 
+## Modes
+
+### `setup` (default)
+
+Generates `.github/copilot-instructions.md` and `.mcp.json`, then indexes your source files into the Brain. Run on every push to `main` to keep the index fresh.
+
+### `learn`
+
+Auto-learns from recent commits and PR metadata. Wire this to `pull_request: types: [closed]` so your Brain grows on every merge — no manual `learn_from_attempts` calls needed.
+
+### `scan`
+
+PR risk scan. Calls `brain_plan` + `smart_recall` against the PR diff and posts a comment with a risk score (0–100) and a list of predicted failure patterns. Run this on `pull_request: types: [opened, synchronize]` before CI runs so reviewers see the risk upfront.
+
+### `hygiene`
+
+Weekly Brain sweep. Archives stale lessons, flags provisional knowledge, and removes orphaned entries. Schedule via `workflow_dispatch` or a weekly cron — keeps Brain quality high over time.
+
+## GitLab CI/CD
+
+On GitLab? The same Brain, same modes, same closed-loop self-calibration are
+available via the GitLab template at
+[`templates/cachly.gitlab-ci.yml`](templates/cachly.gitlab-ci.yml). Add to your
+`.gitlab-ci.yml`:
+
+```yaml
+include:
+  - remote: 'https://raw.githubusercontent.com/cachly-dev/cachly-action/main/templates/cachly.gitlab-ci.yml'
+
+variables:
+  CACHLY_INSTANCE_ID: "<your-brain-uuid>"
+
+cachly-learn:
+  extends: .cachly_learn
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+cachly-scan:
+  extends: .cachly_scan
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+```
+
+Set `CACHLY_API_KEY` (masked) in **Settings → CI/CD → Variables**. Outcomes are
+reported to the Brain as source `gitlab_ci`. The Cachly VS Code and JetBrains
+plugins auto-detect a GitLab `origin` and scaffold this for you on setup.
+
 ## Inputs
 
 | Input | Required | Default | Description |
@@ -39,14 +86,100 @@ jobs:
 | `project-description` | ❌ | repo name | Short project description |
 | `index-project` | ❌ | `true` | Index source files into the Brain semantic cache |
 | `index-max-files` | ❌ | `500` | Max files to index per run |
-| `mode` | ❌ | `setup` | `setup` (generate config + index) or `learn` (auto-learn from recent commits — use on PR merge) |
+| `mode` | ❌ | `setup` | `setup` (generate config + index), `learn` (auto-learn from recent commits), `scan` (PR risk scan), or `hygiene` (weekly Brain sweep) |
 | `learn-max-commits` | ❌ | `50` | In `learn` mode: how many recent commits to learn from |
+| `pr-number` | ❌ | — | PR number (required for `scan` mode) |
+| `pr-title` | ❌ | — | PR title passed to risk scan |
+| `pr-body` | ❌ | — | PR body / description passed to risk scan |
+| `scan-top-k` | ❌ | `10` | In `scan` mode: number of Brain lessons to consider |
+| `scan-post-comment` | ❌ | `true` | In `scan` mode: whether to post a PR comment with the risk score |
 
 ## Outputs
 
 | Output | Description |
 |--------|-------------|
 | `indexed-files` | Number of files indexed into the Brain |
+| `risk-score` | Risk score 0–100 produced by `scan` mode (0 = low risk, 100 = very high) |
+| `failures-json` | JSON array of predicted failure patterns from `scan` mode |
+
+---
+
+## Full workflow example
+
+All four modes wired together in one CI file:
+
+```yaml
+name: Cachly Brain
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, closed]
+  schedule:
+    - cron: '0 3 * * 1'   # weekly hygiene — every Monday at 03:00 UTC
+  workflow_dispatch:
+
+jobs:
+  # ── setup: keep the Brain index fresh on every push to main ──────────
+  setup:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachly-dev/cachly-action@v1
+        with:
+          mode: setup
+          instance-id: ${{ secrets.CACHLY_INSTANCE_ID }}
+          api-key: ${{ secrets.CACHLY_API_KEY }}
+          project-description: 'My awesome project'
+      - uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: 'chore: configure Cachly AI Brain'
+          file_pattern: '.github/copilot-instructions.md .mcp.json'
+
+  # ── scan: post PR risk comment before CI runs ─────────────────────────
+  scan:
+    if: github.event_name == 'pull_request' && github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachly-dev/cachly-action@v1
+        with:
+          mode: scan
+          instance-id: ${{ secrets.CACHLY_INSTANCE_ID }}
+          api-key: ${{ secrets.CACHLY_API_KEY }}
+          pr-number: ${{ github.event.pull_request.number }}
+          pr-title: ${{ github.event.pull_request.title }}
+          pr-body: ${{ github.event.pull_request.body }}
+          scan-top-k: 10
+          scan-post-comment: 'true'
+
+  # ── learn: auto-learn from every merged PR ────────────────────────────
+  learn:
+    if: github.event_name == 'pull_request' && github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 50
+      - uses: cachly-dev/cachly-action@v1
+        with:
+          mode: learn
+          instance-id: ${{ secrets.CACHLY_INSTANCE_ID }}
+          api-key: ${{ secrets.CACHLY_API_KEY }}
+
+  # ── hygiene: weekly Brain sweep ───────────────────────────────────────
+  hygiene:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: cachly-dev/cachly-action@v1
+        with:
+          mode: hygiene
+          instance-id: ${{ secrets.CACHLY_INSTANCE_ID }}
+          api-key: ${{ secrets.CACHLY_API_KEY }}
+```
 
 ---
 
