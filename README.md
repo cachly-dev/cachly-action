@@ -46,6 +46,35 @@ PR risk scan. Calls `brain_plan` + `smart_recall` against the PR diff and posts 
 
 Weekly Brain sweep. Archives stale lessons, flags provisional knowledge, and removes orphaned entries. Schedule via `workflow_dispatch` or a weekly cron — keeps Brain quality high over time.
 
+## GitLab CI/CD
+
+On GitLab? The same Brain, same modes, same closed-loop self-calibration are
+available via the GitLab template at
+[`templates/cachly.gitlab-ci.yml`](templates/cachly.gitlab-ci.yml). Add to your
+`.gitlab-ci.yml`:
+
+```yaml
+include:
+  - remote: 'https://raw.githubusercontent.com/cachly-dev/cachly-action/main/templates/cachly.gitlab-ci.yml'
+
+variables:
+  CACHLY_INSTANCE_ID: "<your-brain-uuid>"
+
+cachly-learn:
+  extends: .cachly_learn
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+cachly-scan:
+  extends: .cachly_scan
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+```
+
+Set `CACHLY_API_KEY` (masked) in **Settings → CI/CD → Variables**. Outcomes are
+reported to the Brain as source `gitlab_ci`. The Cachly VS Code and JetBrains
+plugins auto-detect a GitLab `origin` and scaffold this for you on setup.
+
 ## Inputs
 
 | Input | Required | Default | Description |
