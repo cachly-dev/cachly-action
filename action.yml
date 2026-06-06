@@ -411,33 +411,17 @@ runs:
           exit 0
         fi
 
-        # Convert comma-separated topics to JSON array.
-        TOPICS_JSON=$(echo "$CI_TOPICS" | python3 -c "
-import sys, json
-raw = sys.stdin.read().strip()
-topics = [t.strip() for t in raw.split(',') if t.strip()]
-print(json.dumps(topics))
-")
+        # Convert comma-separated topics to JSON arrays (single-line python to
+        # keep the body off column 0 — column-0 heredocs break YAML literal blocks).
+        TOPICS_JSON=$(echo "$CI_TOPICS" | python3 -c "import sys, json; print(json.dumps([t.strip() for t in sys.stdin.read().split(',') if t.strip()]))")
 
         SCAN_JSON="[]"
         if [ -n "$CI_SCAN_TOPICS" ]; then
-          SCAN_JSON=$(echo "$CI_SCAN_TOPICS" | python3 -c "
-import sys, json
-raw = sys.stdin.read().strip()
-topics = [t.strip() for t in raw.split(',') if t.strip()]
-print(json.dumps(topics))
-")
+          SCAN_JSON=$(echo "$CI_SCAN_TOPICS" | python3 -c "import sys, json; print(json.dumps([t.strip() for t in sys.stdin.read().split(',') if t.strip()]))")
         fi
 
-        PAYLOAD=$(python3 -c "
-import json, sys
-print(json.dumps({
-  'job_status': '$JOB_STATUS',
-  'topics': $TOPICS_JSON,
-  'scan_topics': $SCAN_JSON,
-  'source': 'github_actions',
-}))
-")
+        # Pass values via env (not source interpolation) so topics/status can't break out of the python literal.
+        PAYLOAD=$(JOB_STATUS="$JOB_STATUS" TOPICS_JSON="$TOPICS_JSON" SCAN_JSON="$SCAN_JSON" python3 -c "import os, json; print(json.dumps({'job_status': os.environ['JOB_STATUS'], 'topics': json.loads(os.environ['TOPICS_JSON']), 'scan_topics': json.loads(os.environ['SCAN_JSON']), 'source': 'github_actions'}))")
 
         RESPONSE=$(curl -sf \
           -X POST \

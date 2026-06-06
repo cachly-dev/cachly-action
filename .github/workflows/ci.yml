@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main, 'claude/**']
+  pull_request:
+    branches: [main]
+
+jobs:
+  validate:
+    name: Validate action.yml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate YAML syntax
+        run: |
+          python3 -c "import yaml; yaml.safe_load(open('action.yml')); print('action.yml is valid YAML')"
+
+      - name: Check action metadata and modes
+        run: |
+          python3 - <<'PY'
+          import yaml, sys
+          a = yaml.safe_load(open('action.yml'))
+          missing = [k for k in ('name', 'description', 'runs') if k not in a]
+          if missing:
+              sys.exit(f"action.yml missing required keys: {missing}")
+          if a['runs'].get('using') != 'composite':
+              sys.exit("expected a composite action")
+          steps = a['runs'].get('steps', [])
+          # every composite run step must declare a shell
+          for i, s in enumerate(steps):
+              if 'run' in s and 'shell' not in s:
+                  sys.exit(f"step {i} ({s.get('name','?')}) has 'run' but no 'shell'")
+          # the documented modes must each have at least one gated step
+          modes = ('setup', 'learn', 'scan', 'hygiene', 'confirm')
+          guards = ' '.join(str(s.get('if', '')) for s in steps)
+          for m in modes:
+              if f"mode == '{m}'" not in guards:
+                  sys.exit(f"no step guards mode '{m}'")
+          print(f"action '{a['name']}' OK — {len(steps)} steps, modes: {', '.join(modes)}")
+          PY
