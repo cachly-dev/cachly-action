@@ -38,6 +38,7 @@ inputs:
         "setup"    — generate config + index codebase (default, runs on push to main)
         "learn"    — auto-learn lessons from recent git commits (ideal on PR merge)
         "scan"     — scan an open PR for predicted failure modes and post a comment
+        "predict"  — sticky "your Brain would have warned you" PR comment (create-or-update, never spams)
         "hygiene"  — sweep Brain for stale/orphan lessons and flag/archive them (weekly schedule)
         "confirm"  — report CI outcome back to the Brain to self-calibrate confidence (run at end of pipeline)
     required: false
@@ -66,6 +67,24 @@ inputs:
     description: 'In scan mode: post the result as a PR comment (true/false). Requires the GITHUB_TOKEN env var.'
     required: false
     default: 'true'
+  predict-comment:
+    description: |
+      Post ONE sticky Brain prediction comment on the PR ("your Brain would have
+      warned you"). The comment is created once and updated in place on every
+      push (marker: <!-- cachly-brain-predict -->) — it never spams a new comment
+      per commit. Runs standalone via mode "predict", or alongside mode "scan"
+      (where it replaces the legacy per-push scan comment). Needs pr-number,
+      pr-title and a github-token with pull-requests: write.
+    required: false
+    default: 'false'
+  github-token:
+    description: 'In predict mode: token used to read the PR changed files and create/update the sticky comment (needs pull-requests: write). Defaults to the workflow token.'
+    required: false
+    default: ${{ github.token }}
+  predict-min-confidence:
+    description: 'In predict mode: minimum confidence (0–1) a predicted failure needs to appear in the sticky comment'
+    required: false
+    default: '0.5'
   ci-job-status:
     description: 'In confirm mode: outcome of the CI job — "success", "failure", or "cancelled"'
     required: false
@@ -92,6 +111,9 @@ outputs:
   failures-json:
     description: 'In scan mode: JSON array of predicted failure modes'
     value: ${{ steps.scan.outputs.failures-json }}
+  predict-warnings:
+    description: 'In predict mode: number of Brain warnings above the confidence threshold surfaced on the PR'
+    value: ${{ steps.predict.outputs.warnings }}
   ci-updated:
     description: 'In confirm mode: number of lesson confidences updated'
     value: ${{ steps.confirm.outputs.ci-updated }}
@@ -253,6 +275,7 @@ runs:
         PR_BODY: ${{ inputs.pr-body }}
         SCAN_TOP_K: ${{ inputs.scan-top-k }}
         POST_COMMENT: ${{ inputs.scan-post-comment }}
+        PREDICT_COMMENT: ${{ inputs.predict-comment }}
         GH_TOKEN: ${{ env.GITHUB_TOKEN }}
       run: |
         set -euo pipefail
@@ -347,12 +370,181 @@ runs:
         echo "----------------------------------"
 
         # ── Post PR comment ───────────────────────────────────────────────────
-        if [ "$POST_COMMENT" = "true" ] && [ -n "$PR_NUMBER" ] && [ -n "${GH_TOKEN:-}" ]; then
+        # When predict-comment is enabled the sticky prediction comment (step
+        # "predict") supersedes this legacy per-push comment — skip it here.
+        if [ "${PREDICT_COMMENT:-false}" = "true" ]; then
+          echo "ℹ️  predict-comment enabled — legacy scan comment skipped (sticky comment takes over)."
+        elif [ "$POST_COMMENT" = "true" ] && [ -n "$PR_NUMBER" ] && [ -n "${GH_TOKEN:-}" ]; then
           echo "$COMMENT_BODY" | gh pr comment "$PR_NUMBER" \
             --repo "$GITHUB_REPOSITORY" \
             --body-file - && echo "✅ Brain scan comment posted on PR #$PR_NUMBER"
         else
           echo "ℹ️  Comment posting skipped (POST_COMMENT=$POST_COMMENT, PR_NUMBER=$PR_NUMBER)"
+        fi
+
+    # ── mode: predict / predict-comment ────────────────────────────────────────
+    - name: Brain prediction sticky PR comment
+      id: predict
+      if: ${{ inputs.mode == 'predict' || inputs.predict-comment == 'true' }}
+      shell: bash
+      env:
+        CACHLY_API_KEY: ${{ inputs.api-key }}
+        CACHLY_API_URL: ${{ inputs.api-url }}
+        CACHLY_INSTANCE_ID: ${{ inputs.instance-id }}
+        PR_NUMBER: ${{ inputs.pr-number }}
+        PR_TITLE: ${{ inputs.pr-title }}
+        PR_BODY: ${{ inputs.pr-body }}
+        SCAN_TOP_K: ${{ inputs.scan-top-k }}
+        MIN_CONFIDENCE: ${{ inputs.predict-min-confidence }}
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        set -euo pipefail
+
+        MARKER='<!-- cachly-brain-predict -->'
+        GH_API="${GITHUB_API_URL:-https://api.github.com}"
+
+        echo "🧠 Cachly Brain — prediction check for PR #${PR_NUMBER:-?}..."
+
+        # Everything in this step is best-effort: a missing secret or an
+        # unreachable Brain must never fail the host CI.
+        if [ -z "${CACHLY_API_KEY:-}" ] || [ -z "${CACHLY_INSTANCE_ID:-}" ]; then
+          echo "⚠️  api-key / instance-id not configured — skipping (non-blocking)."
+          echo "warnings=0" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        if [ -z "${PR_NUMBER:-}" ] || [ -z "${PR_TITLE:-}" ]; then
+          echo "ℹ️  pr-number / pr-title missing — predict-comment only runs on pull_request events."
+          echo "warnings=0" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # ── Changed files via GitHub API (optional — degrades to title+body) ──
+        CHANGED_FILES=""
+        if [ -n "${GH_TOKEN:-}" ]; then
+          FILES_JSON=$(curl -sf \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "${GH_API}/repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files?per_page=100") || FILES_JSON="[]"
+          CHANGED_FILES=$(echo "$FILES_JSON" | python3 -c "import sys, json; d = json.load(sys.stdin); print(' '.join(f.get('filename', '') for f in d if isinstance(f, dict)))" 2>/dev/null || echo "")
+        fi
+
+        # ── Ask the Brain: PR context → predicted failures ────────────────────
+        # (env-passed python, single expression — values can't break out of the literal)
+        PAYLOAD=$(PR_TITLE="$PR_TITLE" PR_BODY="${PR_BODY:-}" CHANGED_FILES="$CHANGED_FILES" TOP_K="$SCAN_TOP_K" python3 -c "import os, json; print(json.dumps({'pr_title': os.environ.get('PR_TITLE', '')[:300], 'pr_body': (os.environ.get('PR_BODY', '')[:1200] + ' Changed files: ' + os.environ.get('CHANGED_FILES', '')[:1500]).strip(), 'top_k': int(os.environ.get('TOP_K') or 7)}))") || {
+          echo "⚠️  Could not build scan payload — skipping (non-blocking)."
+          echo "warnings=0" >> "$GITHUB_OUTPUT"
+          exit 0
+        }
+
+        RESPONSE=$(curl -sf \
+          -X POST \
+          -H "Authorization: Bearer $CACHLY_API_KEY" \
+          -H "Content-Type: application/json" \
+          -d "$PAYLOAD" \
+          "${CACHLY_API_URL}/api/v1/instances/${CACHLY_INSTANCE_ID}/scan") || {
+          echo "⚠️  Brain scan API unreachable — skipping (non-blocking)."
+          echo "warnings=0" >> "$GITHUB_OUTPUT"
+          exit 0
+        }
+
+        # ── Filter to meaningful confidence, render bullet list ───────────────
+        # First output line = warning count, remaining lines = markdown bullets.
+        PREDICT_MD=$(RESPONSE="$RESPONSE" MIN_CONF="$MIN_CONFIDENCE" python3 -c "
+        import os, json
+        try:
+            d = json.loads(os.environ.get('RESPONSE') or '{}')
+        except ValueError:
+            d = {}
+        try:
+            min_conf = float(os.environ.get('MIN_CONF') or 0.5)
+        except ValueError:
+            min_conf = 0.5
+        sev_icon = {'critical': '🔴', 'major': '🟠', 'minor': '🟡', 'info': '🔵'}
+        warns = [f for f in d.get('failures', []) if isinstance(f, dict) and float(f.get('confidence') or 0) >= min_conf]
+        print(len(warns))
+        for f in warns:
+            icon = sev_icon.get(f.get('severity', 'info'), '⚪')
+            conf = int(float(f.get('confidence') or 0) * 100)
+            topic = f.get('topic', '?')
+            msg = (f.get('message', '') or '').replace(chr(10), ' ')[:160]
+            fix = (f.get('fix', '') or '').replace(chr(10), ' ')[:160]
+            line = f'- {icon} \`{topic}\` — **{conf}% confidence** — {msg}'
+            if fix:
+                line += f' → Fix: {fix}'
+            print(line)
+        " 2>/dev/null || echo "0")
+
+        WARN_COUNT=$(echo "$PREDICT_MD" | head -n 1)
+        BULLETS=$(echo "$PREDICT_MD" | tail -n +2)
+        case "$WARN_COUNT" in
+          ''|*[!0-9]*) WARN_COUNT=0 ;;
+        esac
+        echo "warnings=$WARN_COUNT" >> "$GITHUB_OUTPUT"
+        echo "🔍 Brain prediction complete: $WARN_COUNT warning(s) at ≥ ${MIN_CONFIDENCE} confidence."
+
+        if [ -z "${GH_TOKEN:-}" ]; then
+          echo "ℹ️  No github-token — printing predictions instead of commenting:"
+          echo "$BULLETS"
+          exit 0
+        fi
+
+        # ── Find the existing sticky comment (marker-based, never spams) ──────
+        COMMENTS=$(curl -sf \
+          -H "Authorization: Bearer $GH_TOKEN" \
+          -H "Accept: application/vnd.github+json" \
+          "${GH_API}/repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments?per_page=100") || COMMENTS="[]"
+
+        STICKY_ID=$(echo "$COMMENTS" | python3 -c "
+        import sys, json
+        try:
+            comments = json.load(sys.stdin)
+        except ValueError:
+            comments = []
+        for c in comments:
+            if isinstance(c, dict) and '<!-- cachly-brain-predict -->' in (c.get('body') or ''):
+                print(c.get('id', ''))
+                break
+        " 2>/dev/null || echo "")
+
+        NL=$'\n'
+        FOOTER="<sub>🧠 Powered by [Cachly Brain](https://cachly.dev) — lessons from your team's git history, surfaced before CI fails.</sub>"
+
+        if [ "$WARN_COUNT" -gt 0 ]; then
+          if [ "$WARN_COUNT" = "1" ]; then
+            HEADING="🧠 Cachly Brain: 1 Warnung für diesen PR"
+          else
+            HEADING="🧠 Cachly Brain: ${WARN_COUNT} Warnungen für diesen PR"
+          fi
+          COMMENT_BODY="${MARKER}${NL}## ${HEADING}${NL}${NL}Your Brain has seen these patterns fail before:${NL}${NL}${BULLETS}${NL}${NL}${FOOTER}"
+        elif [ -n "$STICKY_ID" ]; then
+          # No predictions: never open a new comment — only collapse an existing one.
+          COMMENT_BODY="${MARKER}${NL}<details>${NL}<summary>🧠 Cachly Brain: no known risks for this PR</summary>${NL}${NL}No known failure patterns match the latest changes — earlier warnings no longer apply.${NL}${NL}</details>${NL}${NL}${FOOTER}"
+        else
+          echo "✅ No predictions above threshold and no existing sticky comment — staying silent."
+          exit 0
+        fi
+
+        JSON_BODY=$(COMMENT_BODY="$COMMENT_BODY" python3 -c "import os, json; print(json.dumps({'body': os.environ['COMMENT_BODY']}))") || {
+          echo "⚠️  Could not encode comment body — skipping (non-blocking)."
+          exit 0
+        }
+
+        if [ -n "$STICKY_ID" ]; then
+          curl -sf -X PATCH \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -d "$JSON_BODY" \
+            "${GH_API}/repos/${GITHUB_REPOSITORY}/issues/comments/${STICKY_ID}" > /dev/null \
+            && echo "✅ Sticky Brain comment updated on PR #${PR_NUMBER}." \
+            || echo "⚠️  Could not update sticky comment (non-blocking)."
+        else
+          curl -sf -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -d "$JSON_BODY" \
+            "${GH_API}/repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" > /dev/null \
+            && echo "✅ Sticky Brain comment posted on PR #${PR_NUMBER}." \
+            || echo "⚠️  Could not post sticky comment (non-blocking)."
         fi
 
     # ── mode: hygiene ──────────────────────────────────────────────────────────
@@ -404,6 +596,36 @@ runs:
         echo "🤖 Cachly Brain — reporting CI outcome for self-calibration..."
         echo "   Instance: $CACHLY_INSTANCE_ID"
         echo "   Status:   $JOB_STATUS"
+
+        # Degrade gracefully without secrets — never fail the host CI.
+        if [ -z "${CACHLY_API_KEY:-}" ] || [ -z "${CACHLY_INSTANCE_ID:-}" ]; then
+          echo "⚠️  api-key / instance-id not configured — skipping Brain confirm (non-blocking)."
+          echo "ci-updated=0" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # ── CI failure → Brain lesson (auto-learn) ─────────────────────────────
+        # A red pipeline becomes a lesson in the documented format
+        # (topic / outcome / what_worked / what_failed), so the next PR scan
+        # can warn: "your Brain would have warned you". Best-effort only.
+        if [ "$JOB_STATUS" = "failure" ]; then
+          LESSON_TOPIC=$(echo "$CI_TOPICS" | cut -d',' -f1 | tr -d ' ')
+          if [ -z "$LESSON_TOPIC" ]; then
+            LESSON_TOPIC="ci:${GITHUB_REPOSITORY##*/}"
+          fi
+          RUN_URL="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID:-0}"
+          LESSON_PAYLOAD=$(LESSON_TOPIC="$LESSON_TOPIC" RUN_URL="$RUN_URL" CI_TOPICS="$CI_TOPICS" python3 -c "import os, json; topics = [t.strip() for t in os.environ.get('CI_TOPICS', '').split(',') if t.strip()]; print(json.dumps({'topic': os.environ['LESSON_TOPIC'], 'outcome': 'failure', 'what_worked': 'Not yet resolved - inspect the failing run: ' + os.environ['RUN_URL'], 'what_failed': 'CI failed' + ((' for topics: ' + ', '.join(topics)) if topics else '') + ' - ' + os.environ['RUN_URL'], 'severity': 'major', 'tags': ['ci', 'auto-learn'], 'source': 'github_actions'}))" 2>/dev/null) || LESSON_PAYLOAD=""
+          if [ -n "$LESSON_PAYLOAD" ]; then
+            curl -sf \
+              -X POST \
+              -H "Authorization: Bearer $CACHLY_API_KEY" \
+              -H "Content-Type: application/json" \
+              -d "$LESSON_PAYLOAD" \
+              "${CACHLY_API_URL}/api/v1/instances/${CACHLY_INSTANCE_ID}/learn" > /dev/null \
+              && echo "🧠 CI failure recorded as Brain lesson: $LESSON_TOPIC" \
+              || echo "⚠️  Brain learn API unreachable — failure lesson skipped (non-blocking)."
+          fi
+        fi
 
         if [ -z "$CI_TOPICS" ]; then
           echo "⚠️  ci-topics is empty — nothing to confirm."

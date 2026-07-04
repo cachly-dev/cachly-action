@@ -42,6 +42,31 @@ Auto-learns from recent commits and PR metadata. Wire this to `pull_request: typ
 
 PR risk scan. Calls `brain_plan` + `smart_recall` against the PR diff and posts a comment with a risk score (0–100) and a list of predicted failure patterns. Run this on `pull_request: types: [opened, synchronize]` before CI runs so reviewers see the risk upfront.
 
+### `predict` — sticky "your Brain would have warned you" comment
+
+Like `scan`, but built for repeat pushes: it matches the PR title, body **and
+changed file paths** against your Brain's failure lessons and maintains **one**
+sticky PR comment (marker `<!-- cachly-brain-predict -->`) that is created once
+and updated in place on every push — it never spams a new comment per commit.
+
+- Predictions above `predict-min-confidence` → the comment lists each pattern
+  with severity, confidence and the known fix.
+- No predictions → **no comment at all**. If an earlier push left a warning
+  comment, it is updated and collapsed to "no known risks" instead of deleted.
+
+Enable it standalone with `mode: predict`, or add `predict-comment: 'true'` to
+an existing `scan` job (the sticky comment then replaces the legacy per-push
+scan comment). See the copy-paste snippet below.
+
+### `confirm`
+
+Reports the CI outcome back to the Brain at the end of the pipeline so lesson
+confidences self-calibrate. On `ci-job-status: failure` it **also records the
+failure as a Brain lesson automatically** (topic = first `ci-topics` entry,
+outcome `failure`, linked to the failing run) — so the next PR that touches the
+same area gets a "your Brain would have warned you" prediction. Both calls are
+best-effort: missing secrets or an unreachable API never fail your CI.
+
 ### `hygiene`
 
 Weekly Brain sweep. Archives stale lessons, flags provisional knowledge, and removes orphaned entries. Schedule via `workflow_dispatch` or a weekly cron — keeps Brain quality high over time.
@@ -86,13 +111,19 @@ plugins auto-detect a GitLab `origin` and scaffold this for you on setup.
 | `project-description` | ❌ | repo name | Short project description |
 | `index-project` | ❌ | `true` | Index source files into the Brain semantic cache |
 | `index-max-files` | ❌ | `500` | Max files to index per run |
-| `mode` | ❌ | `setup` | `setup` (generate config + index), `learn` (auto-learn from recent commits), `scan` (PR risk scan), or `hygiene` (weekly Brain sweep) |
+| `mode` | ❌ | `setup` | `setup` (generate config + index), `learn` (auto-learn from recent commits), `scan` (PR risk scan), `predict` (sticky PR prediction comment), `hygiene` (weekly Brain sweep), or `confirm` (report CI outcome back to the Brain) |
 | `learn-max-commits` | ❌ | `50` | In `learn` mode: how many recent commits to learn from |
-| `pr-number` | ❌ | — | PR number (required for `scan` mode) |
-| `pr-title` | ❌ | — | PR title passed to risk scan |
-| `pr-body` | ❌ | — | PR body / description passed to risk scan |
-| `scan-top-k` | ❌ | `10` | In `scan` mode: number of Brain lessons to consider |
+| `pr-number` | ❌ | — | PR number (required for `scan` / `predict` modes) |
+| `pr-title` | ❌ | — | PR title passed to risk scan / prediction |
+| `pr-body` | ❌ | — | PR body / description passed to risk scan / prediction |
+| `scan-top-k` | ❌ | `10` | In `scan` / `predict` mode: number of Brain lessons to consider |
 | `scan-post-comment` | ❌ | `true` | In `scan` mode: whether to post a PR comment with the risk score |
+| `predict-comment` | ❌ | `false` | Maintain ONE sticky Brain prediction comment on the PR (create-or-update, never spams per push). Implied by `mode: predict` |
+| `github-token` | ❌ | workflow token | In `predict` mode: token to read PR changed files and create/update the sticky comment (`pull-requests: write`) |
+| `predict-min-confidence` | ❌ | `0.5` | In `predict` mode: minimum confidence (0–1) for a prediction to appear in the comment |
+| `ci-job-status` | ❌ | — | In `confirm` mode: `success`, `failure` or `cancelled`. On `failure` a Brain lesson is recorded automatically |
+| `ci-topics` | ❌ | — | In `confirm` mode: comma-separated Brain topics touched by this CI run |
+| `ci-scan-topics` | ❌ | — | In `confirm` mode: topics a previous scan predicted would fail (false-positive detection) |
 
 ## Outputs
 
@@ -101,6 +132,57 @@ plugins auto-detect a GitLab `origin` and scaffold this for you on setup.
 | `indexed-files` | Number of files indexed into the Brain |
 | `risk-score` | Risk score 0–100 produced by `scan` mode (0 = low risk, 100 = very high) |
 | `failures-json` | JSON array of predicted failure patterns from `scan` mode |
+| `predict-warnings` | Number of Brain warnings surfaced by `predict` mode (0 = comment stays silent) |
+| `ci-updated` | Number of lesson confidences updated by `confirm` mode |
+
+---
+
+## 🧠 "Your Brain would have warned you" — sticky PR prediction comment
+
+Copy-paste this workflow and every pull request gets checked against your
+team's failure history. If the Brain knows a matching pattern, it posts **one**
+comment like:
+
+> ## 🧠 Cachly Brain: 2 Warnungen für diesen PR
+> - 🔴 `deploy:k8s` — **90% confidence** — Rollout stuck: readinessProbe too strict → Fix: increase failureThreshold to 10
+> - 🟡 `web:hydration` — **65% confidence** — typeof window in useState initializer → Fix: useState(safeDefault) + useEffect
+
+The comment is updated in place on every push (never one comment per commit),
+and if the risks disappear it collapses to "no known risks". PRs with no
+matching patterns get **no comment at all**.
+
+```yaml
+name: Brain predict
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: write   # needed to create/update the sticky comment
+
+jobs:
+  predict:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: cachly-dev/cachly-action@v1
+        with:
+          mode: predict
+          instance-id: ${{ secrets.CACHLY_INSTANCE_ID }}
+          api-key: ${{ secrets.CACHLY_API_KEY }}
+          pr-number: ${{ github.event.pull_request.number }}
+          pr-title: ${{ github.event.pull_request.title }}
+          pr-body: ${{ github.event.pull_request.body }}
+          # github-token defaults to the workflow token — override for a bot identity:
+          # github-token: ${{ secrets.BOT_TOKEN }}
+          # predict-min-confidence: '0.5'
+```
+
+No checkout step needed — changed files are read via the GitHub API. Missing
+secrets or an unreachable Brain never fail the job. Close the loop by feeding
+CI results back with `mode: confirm` (`ci-job-status: ${{ job.status }}`): red
+pipelines become lessons automatically, so the *next* PR touching the same
+area gets warned.
 
 ---
 
