@@ -40,7 +40,7 @@ Auto-learns from recent commits and PR metadata. Wire this to `pull_request: typ
 
 ### `scan`
 
-PR risk scan. Calls `brain_plan` + `smart_recall` against the PR diff and posts a comment with a risk score (0–100) and a list of predicted failure patterns. Run this on `pull_request: types: [opened, synchronize]` before CI runs so reviewers see the risk upfront.
+PR risk scan. Sends the PR title and body to the Brain's `/scan` API, which matches them against your failure lessons, then posts a comment with a risk score (0–100) and a list of predicted failure patterns. Run this on `pull_request: types: [opened, synchronize]` before CI runs so reviewers see the risk upfront.
 
 ### `predict` — sticky "your Brain would have warned you" comment
 
@@ -73,9 +73,10 @@ Weekly Brain sweep. Archives stale lessons, flags provisional knowledge, and rem
 
 ## GitLab CI/CD
 
-On GitLab? The same Brain, same modes, same closed-loop self-calibration are
-available via the GitLab template at
-[`templates/cachly.gitlab-ci.yml`](templates/cachly.gitlab-ci.yml). Add to your
+On GitLab? The same Brain and the same closed-loop self-calibration are
+available for the `learn`, `scan` and `confirm` modes via the GitLab template at
+[`templates/cachly.gitlab-ci.yml`](templates/cachly.gitlab-ci.yml)
+(`setup`, `predict` and `hygiene` are GitHub-Action-only for now). Add to your
 `.gitlab-ci.yml`:
 
 ```yaml
@@ -116,7 +117,7 @@ plugins auto-detect a GitLab `origin` and scaffold this for you on setup.
 | `pr-number` | ❌ | — | PR number (required for `scan` / `predict` modes) |
 | `pr-title` | ❌ | — | PR title passed to risk scan / prediction |
 | `pr-body` | ❌ | — | PR body / description passed to risk scan / prediction |
-| `scan-top-k` | ❌ | `10` | In `scan` / `predict` mode: number of Brain lessons to consider |
+| `scan-top-k` | ❌ | `7` | In `scan` / `predict` mode: number of Brain lessons to consider |
 | `scan-post-comment` | ❌ | `true` | In `scan` mode: whether to post a PR comment with the risk score |
 | `predict-comment` | ❌ | `false` | Maintain ONE sticky Brain prediction comment on the PR (create-or-update, never spams per push). Implied by `mode: predict` |
 | `github-token` | ❌ | workflow token | In `predict` mode: token to read PR changed files and create/update the sticky comment (`pull-requests: write`) |

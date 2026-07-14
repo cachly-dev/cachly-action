@@ -1,8 +1,10 @@
 # Cachly Brain — GitLab CI/CD template
 #
 # The GitLab equivalent of the `cachly-dev/cachly-action` GitHub Action.
-# Same modes (setup, learn, scan, confirm, hygiene), same Brain API, same
-# self-calibrating closed loop — reported to the Brain as source "gitlab_ci".
+# Covers the learn, scan and confirm modes (setup, predict and hygiene are
+# GitHub-Action-only for now) — same Brain API, same self-calibrating closed
+# loop, reported to the Brain as source "gitlab_ci". This is an includable
+# template (include: remote:), not a GitLab CI/CD Catalog component.
 #
 # Usage — add this to your project's .gitlab-ci.yml:
 #
