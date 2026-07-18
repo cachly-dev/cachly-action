@@ -74,7 +74,7 @@ Weekly Brain sweep. Archives stale lessons, flags provisional knowledge, and rem
 ## GitLab CI/CD
 
 On GitLab? The same Brain and the same closed-loop self-calibration are
-available for the `learn`, `scan` and `confirm` modes via the GitLab template at
+available for the `learn`, `scan`, `confirm` and `hygiene` modes via the GitLab template at
 [`templates/cachly.gitlab-ci.yml`](templates/cachly.gitlab-ci.yml)
 (`setup`, `predict` and `hygiene` are GitHub-Action-only for now). Add to your
 `.gitlab-ci.yml`:

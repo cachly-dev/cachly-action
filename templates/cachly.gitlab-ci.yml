@@ -1,7 +1,7 @@
 # Cachly Brain — GitLab CI/CD template
 #
 # The GitLab equivalent of the `cachly-dev/cachly-action` GitHub Action.
-# Covers the learn, scan and confirm modes (setup, predict and hygiene are
+# Covers the learn, scan, confirm and hygiene modes (setup and predict are
 # GitHub-Action-only for now) — same Brain API, same self-calibrating closed
 # loop, reported to the Brain as source "gitlab_ci". This is an includable
 # template (include: remote:), not a GitLab CI/CD Catalog component.
@@ -168,6 +168,30 @@ variables:
           print("✅ Brain confirmed — no confidence changes needed.")
       PY
 
+# ── mode: hygiene ────────────────────────────────────────────────────────────
+# Periodic Brain sweep — dedup, decay stale lessons, flag conflicts. Run on a
+# schedule (Settings → CI/CD → Pipeline schedules), not per-pipeline.
+.cachly_hygiene:
+  image: node:20-slim
+  script:
+    - |
+      echo "🧹 Cachly Brain — running hygiene sweep..."
+      if npx --yes @cachly-dev/mcp-server@latest hygiene --instance-id "$CACHLY_INSTANCE_ID"; then
+        echo "✅ Brain hygiene sweep complete."
+      else
+        echo "⚠️  Brain hygiene CLI unavailable — falling back to API call."
+        # node:20 ships a global fetch, so the fallback needs no curl in the image.
+        node -e '
+          const api = (process.env.CACHLY_API_URL || "https://api.cachly.dev").replace(/\/+$/, "");
+          fetch(api + "/api/v1/mcp/call", {
+            method: "POST",
+            headers: { Authorization: "Bearer " + process.env.CACHLY_API_KEY, "Content-Type": "application/json" },
+            body: JSON.stringify({ tool: "brain_hygiene", args: { instance_id: process.env.CACHLY_INSTANCE_ID } }),
+          }).then(r => r.text()).then(t => console.log(t)).catch(e => console.log("Hygiene skipped (offline): " + e.message));
+        '
+        echo "✅ Brain hygiene sweep complete."
+      fi
+
 # ── Examples (copy into your .gitlab-ci.yml, do not uncomment here) ───────────
 #
 # learn-from-commits:
@@ -185,3 +209,8 @@ variables:
 #   when: always          # run even if earlier jobs failed, so failures are reported
 #   variables:
 #     CACHLY_CI_TOPICS: "auth:jwt,deploy:k8s"
+#
+# brain-hygiene:          # attach to a weekly pipeline schedule
+#   extends: .cachly_hygiene
+#   rules:
+#     - if: '$CI_PIPELINE_SOURCE == "schedule"'
