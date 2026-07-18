@@ -95,11 +95,19 @@ cachly-scan:
   extends: .cachly_scan
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+
+cachly-confirm:
+  extends: .cachly_confirm
+  when: always          # run even if earlier jobs failed, so failures are reported
+  variables:
+    CACHLY_CI_TOPICS: "auth:jwt,deploy:k8s"
 ```
 
 Set `CACHLY_API_KEY` (masked) in **Settings → CI/CD → Variables**. Outcomes are
-reported to the Brain as source `gitlab_ci`. The Cachly VS Code and JetBrains
-plugins auto-detect a GitLab `origin` and scaffold this for you on setup.
+reported to the Brain as source `gitlab_ci`. On a failed pipeline the `confirm`
+job records the failure as a Brain lesson automatically (same as the GitHub
+Action). The Cachly VS Code and JetBrains plugins auto-detect a GitLab `origin`
+and scaffold this for you on setup.
 
 ## Inputs
 

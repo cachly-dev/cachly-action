@@ -118,20 +118,44 @@ variables:
           print("ℹ️  Pipeline cancelled — not reporting to Brain.")
           raise SystemExit(0)
 
-      payload = json.dumps({
+      def post(path, payload):
+          req = urllib.request.Request(
+              f"{api}/api/v1/instances/{inst}/{path}",
+              data=json.dumps(payload).encode(),
+              headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+              method="POST",
+          )
+          return urllib.request.urlopen(req, timeout=15)
+
+      # A red pipeline becomes a Brain lesson (parity with the GitHub Action's
+      # confirm mode) so the next MR scan can warn "your Brain would have caught
+      # this". Best-effort — never fails the pipeline.
+      if status == "failure":
+          run_url = os.environ.get("CI_PIPELINE_URL", "")
+          fail_topic = topics[0]
+          lesson = {
+              "topic": fail_topic,
+              "outcome": "failure",
+              "what_worked": "",
+              "what_failed": "CI failed for topics: " + ", ".join(topics) + ((" - " + run_url) if run_url else ""),
+              "severity": "major",
+              "tags": ["ci", "auto-learn"],
+              "source": "gitlab_ci",
+          }
+          try:
+              post("learn", lesson)
+              print(f"🧠 CI failure recorded as Brain lesson: {fail_topic}")
+          except (urllib.error.URLError, urllib.error.HTTPError) as e:
+              print(f"⚠️  Brain learn API unreachable — failure lesson skipped (non-blocking): {e}")
+
+      payload = {
           "job_status": status,
           "topics": topics,
           "scan_topics": scan_topics,
           "source": "gitlab_ci",
-      }).encode()
-      req = urllib.request.Request(
-          f"{api}/api/v1/instances/{inst}/ci-outcome",
-          data=payload,
-          headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-          method="POST",
-      )
+      }
       try:
-          with urllib.request.urlopen(req, timeout=15) as r:
+          with post("ci-outcome", payload) as r:
               d = json.load(r)
       except (urllib.error.URLError, urllib.error.HTTPError) as e:
           print(f"⚠️  Brain CI outcome API unreachable — skipping (non-blocking): {e}")
